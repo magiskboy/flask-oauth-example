@@ -14,8 +14,17 @@ services:
     ports:
       - 5000:5000
     depends_on:
-      - mysql
+      - migration
       - redis
+    restart: on-failure
+    networks:
+      - mynet
+  migration:
+    build: .
+    environment:
+      - SQLALCHEMY_DATABASE_URI=mysql+pymysql://root:password@mysql:3306/app
+    depends_on:
+      - mysql
     restart: on-failure
     networks:
       - mynet

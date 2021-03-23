@@ -1,5 +1,8 @@
 # Simple blog application
 
+[![GithubCI](https://github.com/magiskboy/flask-oauth-example/workflows/ci/badge.svg)](https://github.com/magiskboy/flask-oauth-example/actions?query=workflow%3ACI)
+
+
 ### API documentation
 
 | Name                         | URL                    | Method | Token? | Body                                      | Params                                                                 | Response                                                                                                                                           |
