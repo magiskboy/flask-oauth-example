@@ -71,7 +71,7 @@ class CreatePostAPITestCase(APITestCase):
                 'name': self.user.name,
                 'email': self.user.email,
                 'iss': datetime.now().timestamp(),
-                'iat': auth.TOKEN_EXPIRED_TIME,
+                'iat': 1000 * 60 * 60 * 24,
             }, key=current_app.config['SECRET_KEY'], algorithm='HS256')
 
             self.access_token = token

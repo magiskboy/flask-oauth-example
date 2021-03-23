@@ -2,7 +2,6 @@ import json
 from functools import partial
 from datetime import datetime
 
-import requests
 from flask_login import (
     LoginManager,
     login_required,
@@ -20,9 +19,12 @@ from flask import (
 from oauthlib.oauth2 import WebApplicationClient
 import jwt
 
+from .oauth2 import (
+    GoogleOAuth2Client,
+    FacebookOAuth2Client,
+)
 from .models import User
 
-TOKEN_EXPIRED_TIME = 1000 * 60 * 60 * 24
 
 login_manager = LoginManager()
 redis = None
@@ -69,154 +71,71 @@ def validate_state(state):
     return True
 
 
-class CallbackHandler:
-    provider = None
+def handle_login(provider, userinfo, token_generator):
+    user = User.query.filter(
+        User.email == userinfo['email']
+    ).first()
+    if not user:
+        abort(400, f'User {userinfo["email"]} is not exist')
 
-    token_endpoint = None
+    dont_link_to_facebook = user.link_to_google and (not user.link_to_facebook and provider == 'facebook')
+    dont_link_to_google = user.link_to_facebook and (not user.link_to_google and provider == 'google')
+    if dont_link_to_facebook or dont_link_to_google:
+        abort(400, f'User {userinfo["email"]} is not linked to { provider}')
 
-    userinfo_endpoint = None
+    token = token_generator({
+        'id': user.id,
+        'name': user.name,
+        'email': user.email,
+        'iss': datetime.now().timestamp(),
+        'iat': 1000 * 60 * 60 * 24,
+    })
 
-    def __init__(self, action, code, client_id, client_secret, token_gen):
-        self.action = action
-        self.code = code
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.token_gen = token_gen
+    redis.sadd('alive_token', token)
 
-    def _do_login(self):
-        userinfo = self._fetch_userinfo()
+    return {
+        'access_token': token,
+    }
 
-        user = User.query.filter(
-            User.email == userinfo['email']
-        ).first()
-        if not user:
-            abort(400, f'User {userinfo["email"]} is not exist')
 
-        dont_link_to_facebook = user.link_to_google and (not user.link_to_facebook and self.provider == 'facebook')
-        dont_link_to_google = user.link_to_facebook and (not user.link_to_google and self.provider == 'google')
+def handle_register(provider, userinfo, token_generator):
+    user = User.query.filter(
+        User.email == userinfo['email']
+    ).first()
+
+    if user:
+        dont_link_to_facebook = user.link_to_google and (not user.link_to_facebook and provider == 'facebook')
+        dont_link_to_google = user.link_to_facebook and (not user.link_to_google and provider == 'google')
         if dont_link_to_facebook or dont_link_to_google:
-            abort(400, f'User {userinfo["email"]} is not linked to {self.provider}')
+            # need user confirm by sending to processing link
+            token = token_generator({
+                'id': user.id,
+                'name': user.name,
+                'email': user.email,
+                'iss': datetime.now().timestamp(),
+                'iat': 1000 * 60 * 5,
+            })
+            redis.sadd('alive_token', token)
 
-        token = self.token_gen({
-            'id': user.id,
-            'name': user.name,
-            'email': user.email,
-            'iss': datetime.now().timestamp(),
-            'iat': TOKEN_EXPIRED_TIME
-        })
-
-        redis.sadd('alive_token', token)
-
-        return {
-            'access_token': token,
-        }
-
-    def _do_register(self):
-        userinfo = self._fetch_userinfo()
-
-        user = User.query.filter(
-            User.email == userinfo['email']
-        ).first()
-
-        if user:
-            dont_link_to_facebook = user.link_to_google and (not user.link_to_facebook and self.provider == 'facebook')
-            dont_link_to_google = user.link_to_facebook and (not user.link_to_google and self.provider == 'google')
-            if dont_link_to_facebook or dont_link_to_google:
-                # need user confirm by sending to processing link
-                token = self.token_gen({
-                    'id': user.id,
-                    'name': user.name,
-                    'email': user.email,
-                    'iss': datetime.now().timestamp(),
-                    'iat': 1000 * 60 * 5,
-                })
-                redis.sadd('alive_token', token)
-
-                return {
-                    'message': f'Email {userinfo["email"]} was used by {user.name}. Do you link to the {self.provider} account',
-                    'data': {
-                        'link': url_for('auth.link_account', access_token=token, provider=self.provider, _external=True),
-                    }
+            return {
+                'message': f'Email {userinfo["email"]} was used by {user.name}. Do you link to the {provider} account',
+                'data': {
+                    'link': url_for('auth.link_account', access_token=token, provider=provider, _external=True),
                 }
+            }
 
-            abort(400, f'User {userinfo["email"]} existed')
+        abort(400, f'User {userinfo["email"]} existed')
 
-        new_user = User(
-            email=userinfo['email'],
-            name=userinfo['name'],
-        )
-        if self.provider == 'google':
-            new_user.link_to_google = True
-        elif self.provider == 'facebook':
-            new_user.link_to_facebook = True
-        new_user.save()
-        return {'message': f'Create {userinfo["email"]} successful'}
-
-    def _fetch_userinfo(self):
-        client = WebApplicationClient(self.client_id)
-
-        # get access token
-        token_url, headers, body = client.prepare_token_request(
-            self.token_endpoint,
-            authorization_response=request.url,
-            redirect_url=request.base_url,
-            code=self.code,
-        )
-
-        token_response = requests.post(
-            token_url,
-            headers=headers,
-            data=body,
-            auth=(self.client_id, self.client_secret),
-        )
-        client.parse_request_body_response(token_response.text)
-
-        # get user information
-        uri, headers, body = client.add_token(self.userinfo_endpoint)
-        userinfo_response = requests.get(uri, headers=headers, data=body)
-        data = userinfo_response.json()
-
-        return data
-
-    def handle(self, *args, **kwargs):
-        action = self.action
-
-        if action == 'login':
-            result = self._do_login(*args, **kwargs)
-        elif action == 'register':
-            result = self._do_register(*args, **kwargs)
-
-        return result
-
-
-class GoogleCallbackHandler(CallbackHandler):
-    provider = 'google'
-
-    token_endpoint = 'https://oauth2.googleapis.com/token'
-
-    userinfo_endpoint = 'https://openidconnect.googleapis.com/v1/userinfo'
-
-    def _fetch_userinfo(self):
-        raw_data = super()._fetch_userinfo()
-        return {
-            'name': raw_data.get('name'),
-            'email': raw_data.get('email'),
-        }
-
-
-class FacebookCallbackHandler(CallbackHandler):
-    provider = 'facebook'
-
-    token_endpoint = 'https://graph.facebook.com/v10.0/oauth/access_token'
-
-    userinfo_endpoint = 'https://graph.facebook.com/v10.0/me?fields=name,email'
-
-    def _fetch_userinfo(self):
-        raw_data = super()._fetch_userinfo()
-        return {
-            'name': raw_data.get('name'),
-            'email': raw_data.get('email'),
-        }
+    new_user = User(
+        email=userinfo['email'],
+        name=userinfo['name'],
+    )
+    if provider == 'google':
+        new_user.link_to_google = True
+    elif provider == 'facebook':
+        new_user.link_to_facebook = True
+    new_user.save()
+    return {'message': f'Create {userinfo["email"]} successful'}
 
 
 bp = Blueprint('auth', __name__)
@@ -224,30 +143,27 @@ bp = Blueprint('auth', __name__)
 
 @bp.route('/')
 def handle_auth():
+    redirect_uri = url_for('auth.oauth_callback', _external=True)
     state = request.args.to_dict()
     if not validate_state(state):
         abort(400, 'Action or Provider is invalid')
 
     provider = state.get('provider')
-    redirect_uri = url_for('auth.oauth_callback', _external=True)
     if provider == 'google':
-        CLIENT_ID = current_app.config['GOOGLE_CLIENT_ID']
-        authorization_endpoint = 'https://accounts.google.com/o/oauth2/v2/auth'
-        scope=["openid", "email", "profile"]
+        return redirect(GoogleOAuth2Client.get_grant_request_url(
+            current_app.config['GOOGLE_CLIENT_ID'],
+            redirect_uri,
+            ['openid', 'email', 'profile'],
+            state,
+        ))
 
-    elif provider == 'facebook':
-        CLIENT_ID = current_app.config['FACEBOOK_CLIENT_ID']
-        authorization_endpoint = 'https://www.facebook.com/v10.0/dialog/oauth'
-        scope = ['email',]
-
-    oauth_client = WebApplicationClient(CLIENT_ID)
-    request_uri = oauth_client.prepare_request_uri(
-        authorization_endpoint,
-        redirect_uri=redirect_uri,
-        scope=scope,
-        state=json.dumps(state),
-    )
-    return redirect(request_uri)
+    if provider == 'facebook':
+        return redirect(FacebookOAuth2Client.get_grant_request_url(
+            current_app.config['FACEBOOK_CLIENT_ID'],
+            redirect_uri,
+            ['email'],
+            state,
+        ))
 
 
 @bp.route('/callback')
@@ -256,33 +172,33 @@ def oauth_callback():
     if not validate_state(state):
         abort(400, 'Action or Provider is invalid')
 
-    action, provider = state['action'], state['provider']
+    provider = state['provider']
     code = request.args.get('code', type=str)
-    token_generator = partial(
-        jwt.encode,
-        algorithm='HS256',
-        key=current_app.config['SECRET_KEY'],
-    )
-
     if provider == 'google':
-        handler = GoogleCallbackHandler(
-            action=action,
-            code=code,
-            client_id=current_app.config['GOOGLE_CLIENT_ID'],
-            client_secret=current_app.config['GOOGLE_CLIENT_SECRET'],
-            token_gen=token_generator,
+        userinfo = GoogleOAuth2Client.get_userinfo(
+            current_app.config['GOOGLE_CLIENT_ID'],
+            current_app.config['GOOGLE_CLIENT_SECRET'],
+            code,
+            request.url,
         )
 
     elif provider == 'facebook':
-        handler = FacebookCallbackHandler(
-            action=action,
-            code=code,
-            client_id=current_app.config['FACEBOOK_CLIENT_ID'],
-            client_secret=current_app.config['FACEBOOK_CLIENT_SECRET'],
-            token_gen=token_generator,
+        userinfo = FacebookOAuth2Client.get_userinfo(
+            current_app.config['FACEBOOK_CLIENT_ID'],
+            current_app.config['FACEBOOK_CLIENT_SECRET'],
+            code,
+            request.url,
         )
 
-    return handler.handle()
+    action = state.get('action')
+    if action == 'login':
+        handle = handle_login
+    elif action == 'register':
+        handle = handle_register
+
+    token_generator = partial(jwt.encode, key=current_app.config['SECRET_KEY'],
+                              algorithm='HS256')
+    return handle(provider, userinfo, token_generator)
 
 
 @bp.route('/link_account')
