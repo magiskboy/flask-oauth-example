@@ -1,0 +1,6 @@
+db.sqlite3
+requirements-test.txt
+README.md
+.git
+.gitignore
+tests
